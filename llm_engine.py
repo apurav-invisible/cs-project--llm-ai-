@@ -9,6 +9,8 @@ import random
 
 load_dotenv()
 
+user_sessions ={}
+
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1"  # ✅ correct base URL
 ALL_MODELS = [
@@ -21,7 +23,7 @@ ALL_MODELS = [
     "z-ai/glm-4.5-air:free"
 ]
 MODEL = random.choice(ALL_MODELS)
-print("🔑 OpenRouter Key loaded:", bool(OPENROUTER_KEY))
+print(" OpenRouter Key loaded:", bool(OPENROUTER_KEY))
 
 # Initialize OpenRouter client
 client = OpenAI(
@@ -40,110 +42,125 @@ def ask_llm(messages: list) -> str:
                 "X-Title": "NeuraAI Dev"
             },
         )
-        return completion.choices[0].message.content or "⚠️ Empty LLM response"
+        return completion.choices[0].message.content or " Empty LLM response"
     except Exception as e:
-        return f"⚠️ LLM error: {str(e)}"
+        return f" LLM error: {str(e)}"
 
+#ai 
 
-# ---------------- MAIN AI FLOW ----------------
 def ai_res(user_id: str, prompt: str):
-    # Get user memory
-    row = (
-        supabase.table("knowledge_base")
-        .select("knowledge")
-        .eq("id", user_id)
-        .single()
-        .execute()
-    )
-    knowledge = row.data.get("knowledge", {}) if row.data else {}
+    if user_id not in user_sessions:
+        try:
+            row = (
+                supabase.table("knowledge_base")
+                .select("chats")
+                .eq("id", user_id)
+                .single()
+                .execute()
+            )
+            chats = row.data.get("chats", []) if row.data else []
+        except Exception:
+            chats = []
 
-    # Create system context
-    system_prompt = (
-        "You are NeuraAI, a friendly and reasoning AI assistant.\n"+
-        "You think like a human and use user memory if needed.\n"+
-        "If you truly don't know something, reply clearly like: 'I m not sure about that.'\n"
-        f"User memory: {json.dumps(knowledge)}"
-    )
+        user_sessions[user_id] = [{"role": "system", "content": "You are NeuraAI, a friendly and reasoning AI assistant. Remember everything said in this chat like a human would."}]
+        for msg in chats:
+            user_sessions[user_id].append({"role": "user", "content": msg["prompt"]})
+            user_sessions[user_id].append({"role": "assistant", "content": msg["response"]})
 
-    # Compose messages
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt}
-    ]
+    
+    user_sessions[user_id].append({"role": "user", "content": prompt})
 
-    # 🧠 Step 1: Ask LLM first
-    llm_reply = ask_llm(messages)
-
-    if not llm_reply or not isinstance(llm_reply, str):
-        return "(🤖 Neura) ⚠️ No valid response from LLM."
-
-    llm_lower = llm_reply.lower()
-    unsure_patterns = ["i'm not sure", "i dont know", "not sure", "no idea", "sorry"]
-
-    # If confident, return LLM reply
-    if not any(p in llm_lower for p in unsure_patterns):
-        return f"(🤖 Neura) {llm_reply}"
-
-    # 💾 Step 2: Use stored knowledge
-    for q, a in knowledge.items():
-        if q.lower() in prompt.lower():
-            return f"(📘 From your memory) {a}"
-
-    # 🌐 Step 3: Fallback to Wikipedia
     try:
-        summary = wikipedia.summary(prompt, sentences=3)
-        if summary:
-            return f"(🌐 Wikipedia) {summary}"
-    except (DisambiguationError, PageError):
-        pass
-    except Exception:
-        pass
+        completion = client.chat.completions.create(
+            model=MODEL,
+            messages=user_sessions[user_id],
+        )
+        reply = completion.choices[0].message.content
+    except Exception as e:
+        reply = f" LLM error: {str(e)}"
 
-    # Final fallback
-    return f"(🤖 Neura) {llm_reply}"
+    user_sessions[user_id].append({"role": "assistant", "content": reply})
+
+    save(user_id, prompt, reply)
+
+    return f"( Neura) {reply}"
+
 
 
 # ---------------- KNOWLEDGE ADD ----------------
 def add(user_id: str, question: str, answer: str) -> str:
     row = (
         supabase.table("knowledge_base")
-        .select("knowledge")
+        .select("knowledge", "chats")
         .eq("id", user_id)
-        .single()
         .execute()
     )
+
     knowledge = row.data.get("knowledge", {}) if row.data else {}
+    chats = row.data.get("chats", []) if row.data else []
 
     knowledge[question.strip()] = answer
 
     if row.data:
-        supabase.table("knowledge_base").update({"knowledge": knowledge}).eq("id", user_id).execute()
+        # Update both knowledge and chats safely
+        supabase.table("knowledge_base").update({
+            "knowledge": knowledge,
+            "chats": chats
+        }).eq("id", user_id).execute()
     else:
-        supabase.table("knowledge_base").insert(
-            {"id": user_id, "knowledge": knowledge}
-        ).execute() and supabase.table("DATA").insert({"data":[]}).execute()
+        # New user record with both fields
+        supabase.table("knowledge_base").insert({
+            "id": user_id,
+            "knowledge": knowledge,
+            "chats": []
+        }).execute()
 
-    return "✅ Added to your personal knowledge!"
+    return " Added to your personal knowledge!"
 
 
-# ---------------- CHAT SAVE ----------------
 def save(user_id: str, prompt: str, response: str) -> None:
+
     try:
-        # Try to fetch existing chat data
-        row1 = (
-            supabase.table("DATA")
-            .select("data")
+        result = (
+            supabase.table("knowledge_base")
+            .select("chats")
             .eq("id", user_id)
             .single()
             .execute()
         )
-        chats = row1.data.get("data", []) if row1.data else []
-    except Exception:
-        # If no record exists yet
+
+        data = result.data if isinstance(result.data, dict) else {}
+        chats = data.get("chats", []) if data else []
+
+    except Exception as e:
+        print(" Load error:", e)
         chats = []
+        data = None
 
-    # Add the new chat
+    # Append new chat pair
     chats.append({"prompt": prompt, "response": response})
+    chats = chats[-50:]
 
-    # Upsert automatically inserts if no row exists, or updates otherwise
-    supabase.table("DATA").upsert({ "data": chats}).execute()
+    print(f"Total chats after append: {len(chats)}")
+
+    try:
+        if  data != {}:
+            res = (
+                supabase.table("knowledge_base")
+                .update({"chats": chats})
+                .eq("id", user_id)
+                .execute()
+            )
+        else:
+            res = (
+                supabase.table("knowledge_base")
+                .insert({
+                    "id": user_id,
+                    "knowledge": {},
+                    "chats": chats,
+                })
+                .execute()
+            )
+
+    except Exception as e:
+        print(" Save error:", e)
